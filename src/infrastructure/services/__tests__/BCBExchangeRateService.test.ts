@@ -1,13 +1,67 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { BCBExchangeRateService } from '../BCBExchangeRateService';
 
+type MockResponse = Partial<Response> & { json?: () => Promise<unknown> };
+type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<MockResponse>;
+
+const olindaOk = (cotacaoVenda = 5.05): MockResponse => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    value: [
+      {
+        cotacaoCompra: cotacaoVenda - 0.005,
+        cotacaoVenda,
+        dataHoraCotacao: '2023-01-15 13:00:00',
+      },
+    ],
+  }),
+});
+
+const olindaEmpty = (): MockResponse => ({
+  ok: true,
+  status: 200,
+  json: async () => ({ value: [] }),
+});
+
+const olinda503 = (): MockResponse => ({
+  ok: false,
+  status: 503,
+  json: async () => '',
+});
+
+const sgsOk = (valor = '5.3759'): MockResponse => ({
+  ok: true,
+  status: 200,
+  json: async () => [{ data: '03/01/2023', valor }],
+});
+
+const sgsEmpty = (): MockResponse => ({
+  ok: true,
+  status: 200,
+  json: async () => [],
+});
+
+const sgs503 = (): MockResponse => ({
+  ok: false,
+  status: 503,
+  json: async () => '',
+});
+
+const urlOf = (input: string | URL | Request): string =>
+  typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+const isOlinda = (input: string | URL | Request): boolean =>
+  urlOf(input).includes('olinda.bcb.gov.br');
+const isSgs = (input: string | URL | Request): boolean =>
+  urlOf(input).includes('api.bcb.gov.br/dados/serie');
+
 describe('BCBExchangeRateService', () => {
   let service: BCBExchangeRateService;
-  let fetchMock: ReturnType<typeof vi.fn>;
+  let fetchMock: ReturnType<typeof vi.fn<FetchFn>>;
 
   beforeEach(() => {
     service = new BCBExchangeRateService();
-    fetchMock = vi.fn();
+    fetchMock = vi.fn<FetchFn>();
     global.fetch = fetchMock as unknown as typeof fetch;
   });
 
@@ -15,210 +69,189 @@ describe('BCBExchangeRateService', () => {
     vi.restoreAllMocks();
   });
 
-  it('should fetch exchange rate successfully', async () => {
-    const mockResponse = {
-      value: [
-        {
-          cotacaoCompra: 5.0,
-          cotacaoVenda: 5.05,
-          dataHoraCotacao: '2023-01-15 13:00:00'
-        }
-      ]
-    };
+  it('returns the Olinda rate when it responds with data', async () => {
+    fetchMock.mockResolvedValueOnce(olindaOk(5.05));
 
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockResponse
-    });
-
-    const date = new Date('2023-01-15');
-    const rate = await service.getRate('USD', 'BRL', date);
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-15'));
 
     expect(rate).not.toBeNull();
     expect(rate?.fromCurrency).toBe('USD');
     expect(rate?.toCurrency).toBe('BRL');
-    // Service uses cotacaoVenda for both rates per Art. 57 of IN RFB
     expect(rate?.bidRate).toBe(5.05);
     expect(rate?.askRate).toBe(5.05);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toMatch(/olinda\.bcb\.gov\.br/);
   });
 
-  it('should return null for unsupported currency pair', async () => {
-    const date = new Date('2023-01-15');
-    
-    await expect(
-      service.getRate('EUR', 'BRL', date)
-    ).rejects.toThrow('Unsupported currency pair: EUR/BRL');
+  it('rejects unsupported currency pairs synchronously', async () => {
+    await expect(service.getRate('EUR', 'BRL', new Date('2023-01-15'))).rejects.toThrow(
+      'Unsupported currency pair: EUR/BRL'
+    );
   });
 
-  it('should cache successful results', async () => {
-    const mockResponse = {
-      value: [
-        {
-          cotacaoCompra: 5.0,
-          cotacaoVenda: 5.05,
-          dataHoraCotacao: '2023-01-15 13:00:00'
-        }
-      ]
-    };
-
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      json: async () => mockResponse
-    });
+  it('caches successful Olinda results', async () => {
+    fetchMock.mockResolvedValueOnce(olindaOk(5.05));
 
     const date = new Date('2023-01-15');
-    
-    // First call
     const rate1 = await service.getRate('USD', 'BRL', date);
-    expect(rate1).not.toBeNull();
-    
-    // Second call should use cache
     const rate2 = await service.getRate('USD', 'BRL', date);
+
+    expect(rate1).not.toBeNull();
     expect(rate2).not.toBeNull();
-    
-    // Fetch should only be called once
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('should return null when API returns empty data', async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ value: [] })
-    });
+  it('returns null when Olinda authoritatively reports no PTAX (200 + empty list)', async () => {
+    fetchMock.mockResolvedValueOnce(olindaEmpty());
 
-    const date = new Date('2023-01-15');
-    const rate = await service.getRate('USD', 'BRL', date);
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-15'));
 
     expect(rate).toBeNull();
+    // Should NOT have hit SGS — Olinda was authoritative.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('should return null when API request fails', async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 404
-    });
+  it('returns null when Olinda returns 404 (treated as authoritative)', async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 404 });
 
-    const date = new Date('2023-01-15');
-    const rate = await service.getRate('USD', 'BRL', date);
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-15'));
 
     expect(rate).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('should handle network errors gracefully', async () => {
-    fetchMock.mockRejectedValueOnce(new Error('Network error'));
-
-    const date = new Date('2023-01-15');
-    const rate = await service.getRate('USD', 'BRL', date);
-
-    expect(rate).toBeNull();
-  });
-
-  it('should format date correctly', async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ value: [] })
+  it('falls back to SGS when Olinda returns 503 on every retry', async () => {
+    fetchMock.mockImplementation((url) => {
+      if (isOlinda(url)) return Promise.resolve(olinda503());
+      if (isSgs(url)) return Promise.resolve(sgsOk('5.3759'));
+      return Promise.reject(new Error(`Unexpected URL ${urlOf(url)}`));
     });
 
-    const date = new Date(2023, 0, 5); // January 5, 2023
-    await service.getRate('USD', 'BRL', date);
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-03'));
 
-    expect(fetchMock).toHaveBeenCalled();
-    const firstCall = fetchMock.mock.calls[0];
-    expect(firstCall).toBeDefined();
-    
-    if (firstCall) {
-      const callUrl = firstCall[0] as string;
-      expect(callUrl).toContain('01-05-2023');
-    }
+    expect(rate).not.toBeNull();
+    expect(rate?.bidRate).toBe(5.3759);
+    expect(rate?.askRate).toBe(5.3759);
+
+    const calledUrls = fetchMock.mock.calls.map((c) => c[0] as string);
+    // 3 retries on Olinda + 1 successful SGS call.
+    expect(calledUrls.filter(isOlinda)).toHaveLength(3);
+    expect(calledUrls.filter(isSgs)).toHaveLength(1);
   });
 
-  it('should cache null results to avoid repeated failed requests', async () => {
-    fetchMock.mockResolvedValueOnce({
-      ok: false,
-      status: 404
+  it('falls back to SGS when Olinda throws a network error', async () => {
+    fetchMock.mockImplementation((url) => {
+      if (isOlinda(url)) return Promise.reject(new Error('Network error'));
+      if (isSgs(url)) return Promise.resolve(sgsOk('5.3759'));
+      return Promise.reject(new Error(`Unexpected URL ${urlOf(url)}`));
     });
 
-    const date = new Date('2023-01-15');
-    
-    // First call
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-03'));
+
+    expect(rate?.bidRate).toBe(5.3759);
+  });
+
+  it('returns null without caching when both providers are unreachable', { timeout: 30_000 }, async () => {
+    fetchMock.mockImplementation((url) => {
+      if (isOlinda(url)) return Promise.resolve(olinda503());
+      if (isSgs(url)) return Promise.resolve(sgs503());
+      return Promise.reject(new Error(`Unexpected URL ${urlOf(url)}`));
+    });
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const date = new Date('2023-01-03');
     const rate1 = await service.getRate('USD', 'BRL', date);
     expect(rate1).toBeNull();
-    
-    // Second call should use cached null
+    expect(warnSpy).toHaveBeenCalled();
+
+    // A second call must retry (failure was NOT cached), so the BCB has a chance
+    // to recover during the same user session.
+    const callsBefore = fetchMock.mock.calls.length;
     const rate2 = await service.getRate('USD', 'BRL', date);
     expect(rate2).toBeNull();
-    
-    // Fetch should only be called once
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(callsBefore);
+
+    warnSpy.mockRestore();
+  });
+
+  it('returns SGS data when Olinda is down and SGS reports the rate', async () => {
+    fetchMock.mockImplementation((url) => {
+      if (isOlinda(url)) return Promise.resolve(olinda503());
+      if (isSgs(url)) return Promise.resolve(sgsOk('5.40'));
+      return Promise.reject(new Error(`Unexpected URL ${urlOf(url)}`));
+    });
+
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-04'));
+
+    expect(rate?.bidRate).toBe(5.4);
+  });
+
+  it('returns null when Olinda is down and SGS authoritatively has no data', async () => {
+    fetchMock.mockImplementation((url) => {
+      if (isOlinda(url)) return Promise.resolve(olinda503());
+      if (isSgs(url)) return Promise.resolve(sgsEmpty());
+      return Promise.reject(new Error(`Unexpected URL ${urlOf(url)}`));
+    });
+
+    const rate = await service.getRate('USD', 'BRL', new Date('2023-01-07'));
+
+    expect(rate).toBeNull();
+  });
+
+  it('uses MM-DD-YYYY for Olinda and DD/MM/YYYY for SGS', async () => {
+    fetchMock.mockImplementation((url) => {
+      if (isOlinda(url)) return Promise.resolve(olinda503());
+      if (isSgs(url)) return Promise.resolve(sgsOk('5.0'));
+      return Promise.reject(new Error(`Unexpected URL ${urlOf(url)}`));
+    });
+
+    await service.getRate('USD', 'BRL', new Date(2023, 0, 5)); // January 5, 2023
+
+    const urls = fetchMock.mock.calls.map((c) => c[0] as string);
+    const olindaCall = urls.find(isOlinda);
+    const sgsCall = urls.find(isSgs);
+
+    expect(olindaCall).toBeDefined();
+    expect(sgsCall).toBeDefined();
+    expect(olindaCall).toContain("'01-05-2023'");
+    expect(sgsCall).toContain('dataInicial=05/01/2023');
+    expect(sgsCall).toContain('dataFinal=05/01/2023');
+  });
+
+  it('caches authoritative null results to avoid re-querying weekends/holidays', async () => {
+    fetchMock.mockResolvedValue(olindaEmpty());
+
+    const date = new Date('2023-01-15'); // Sunday
+    const rate1 = await service.getRate('USD', 'BRL', date);
+    const rate2 = await service.getRate('USD', 'BRL', date);
+
+    expect(rate1).toBeNull();
+    expect(rate2).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('should evict old entries when cache is full', async () => {
-    const mockResponse = {
-      value: [
-        {
-          cotacaoCompra: 5.0,
-          cotacaoVenda: 5.05,
-          dataHoraCotacao: '2023-01-15 13:00:00'
-        }
-      ]
-    };
+  it('respects cache TTL', async () => {
+    fetchMock.mockResolvedValue(olindaOk(5.05));
 
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => mockResponse
-    });
-
-    // Fill cache beyond MAX_CACHE_SIZE (1000)
-    const promises = [];
-    for (let i = 0; i < 1010; i++) {
-      const date = new Date(2023, 0, 1 + (i % 365));
-      promises.push(service.getRate('USD', 'BRL', date));
-    }
-
-    await Promise.all(promises);
-
-    // Cache should have evicted some entries
-    expect(fetchMock).toHaveBeenCalled();
-  });
-
-  it('should respect cache TTL', async () => {
-    const mockResponse = {
-      value: [
-        {
-          cotacaoCompra: 5.0,
-          cotacaoVenda: 5.05,
-          dataHoraCotacao: '2023-01-15 13:00:00'
-        }
-      ]
-    };
-
-    // Mock Date.now to control cache TTL
     const originalDateNow = Date.now;
-    let currentTime = 1000000;
+    let currentTime = 1_000_000;
     Date.now = vi.fn(() => currentTime);
 
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => mockResponse
-    });
+    try {
+      const date = new Date('2023-01-15');
+      await service.getRate('USD', 'BRL', date);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    const date = new Date('2023-01-15');
-    
-    // First call
-    await service.getRate('USD', 'BRL', date);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    
-    // Second call within TTL (should use cache)
-    currentTime += 1000; // 1 second later
-    await service.getRate('USD', 'BRL', date);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    
-    // Third call after TTL expired (should fetch again)
-    currentTime += 24 * 60 * 60 * 1000 + 1000; // 24 hours + 1 second
-    await service.getRate('USD', 'BRL', date);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+      currentTime += 1000;
+      await service.getRate('USD', 'BRL', date);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
 
-    // Restore Date.now
-    Date.now = originalDateNow;
+      currentTime += 24 * 60 * 60 * 1000 + 1000;
+      await service.getRate('USD', 'BRL', date);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      Date.now = originalDateNow;
+    }
   });
 });
